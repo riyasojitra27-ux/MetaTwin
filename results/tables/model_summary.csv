@@ -1,0 +1,8 @@
+metric,value
+mae_persistence,19.696708595387843
+mae_xgboost,9.553421978207421
+rmse_persistence,33.031204377278726
+rmse_xgboost,15.20568749869166
+auroc_failure,0.703997072361741
+auprc_failure,0.18532763225611637
+failure_prevalence,0.061495457721872815
