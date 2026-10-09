@@ -6,98 +6,87 @@
 
 **Static / historical EHR + dynamic wearable/CGM data → personalized digital twin → 60-minute glucose forecast → adverse-event prediction (>180 or <70 mg/dL within 60 minutes) → calibrated reliability gate → Forecast / Caution / Abstain.**
 
-The adverse-event layer is the primary prediction task. Reliability is a safety/uncertainty layer that controls whether an event alert is surfaced.
+The adverse-event layer is the primary prediction task. Reliability is the uncertainty/safety layer controlling whether an event alert is surfaced.
 
-## What is implemented
+## Implemented
 
-- **Two-stream fusion:** static demographics/labs/EHR features + dynamic CGM, heart rate, activity and meal macros.
-- **60-minute forecasting:** XGBoost regressor with a persistence baseline.
-- **Adverse-event prediction:** XGBoost classifier for glucose >180 mg/dL or <70 mg/dL within the next 60 minutes.
-- **Leakage-safe reliability:** patient-grouped OOF forecast residuals, failure label `|error| > 30 mg/dL`, XGBoost failure detector and isotonic probability calibration.
-- **Trust states:** training-only risk thresholds for Forecast / Caution / Abstain; actual holdout coverage is reported rather than assumed.
-- **Reliability-gated alerts:** event alerts are withheld when the reliability layer is Abstain.
-- **What-if:** bounded model-based scenario demonstrations for baseline, activity and reduced-carbohydrate inputs. These are explicitly non-causal and are disabled when reliability is Abstain.
-- **Clinician dashboard:** virtual patient, two data streams, forecast, event risk, trust state, reason codes, cohort triage, research evidence and model-card/safety boundary.
-- **Evaluation:** temporal holdout, AUROC/AUPRC, calibration, abstention curve, precision/recall/F1, false alarms/day and patient-level bootstrap 95% confidence intervals.
+- Static EHR + dynamic CGM, heart rate, activity and meal-macro fusion.
+- XGBoost 60-minute glucose forecasting with persistence baseline.
+- XGBoost adverse-event classifier for >180 or <70 mg/dL within 60 minutes.
+- Leakage-safe reliability: patient-grouped OOF forecast residuals, `|error| > 30 mg/dL` failure label, second grouped OOF classifier calibration, isotonic probability calibration.
+- Training-only Forecast / Caution / Abstain thresholds.
+- Reliability-gated alerts.
+- Bounded, non-causal what-if scenarios; disabled while Abstain.
+- Clinician dashboard with virtual patient, event risk, reliability, reason codes, cohort triage, research evidence and model-card boundary.
+- Temporal holdout evaluation, AUROC/AUPRC, calibration, abstention curve, event precision/recall/F1, false alarms/day and patient-level bootstrap 95% CIs.
 
-## Data
+## Primary real dataset: CGMacros v1.0.0
 
-### Primary real/open dataset: CGMacros
+MetaTwin has a reproducible pipeline for the open **CGMacros v1.0.0** PhysioNet dataset. It contains 45 participants over approximately ten days with two CGMs, Fitbit activity/heart rate, meal macronutrients and baseline clinical measurements. The raw archive is about 627 MB and is not committed to this repository. Dataset access is subject to its published CC BY-NC-SA 4.0 license.
 
-MetaTwin includes a reproducible preparation script for **CGMacros v1.0.0**, an open PhysioNet dataset containing 45 participants (15 healthy, 16 pre-diabetes and 14 T2D) over approximately ten days, with two CGMs, Fitbit activity/heart rate, meal macronutrients and baseline health measurements. The public data are licensed separately and the raw archive is intentionally **not committed to this repository**. The archive is about 627 MB, so downloading it at deployment/startup would be inappropriate. urlCGMacros on PhysioNethttps://www.physionet.org/content/cgmacros/1.0.0/
+Source: https://www.physionet.org/content/cgmacros/1.0.0/
 
-The dataset documentation reports Dexcom G6 Pro at 5-minute sampling, Libre at 15-minute sampling, Fitbit heart rate/activity, meal carbohydrate/protein/fat/fiber, and baseline HbA1c/BMI/fasting glucose and demographics. citeturn1view0turn4view0turn5view0
+## One-command real-data finalization
 
-Prepare the real dataset locally:
+After cloning/pulling this repository, run:
 
 ```bash
-mkdir -p data/raw
-cd data/raw
-wget -r -N -c -np https://physionet.org/files/cgmacros/1.0.0/
-cd ../..
-python scripts/prepare_cgmacros.py --raw-root data/raw --output-root data/processed
-python scripts/evaluate.py
+bash scripts/finalize_real_data.sh
 ```
 
-The preparation script resamples the real data to a five-minute grid, uses Dexcom as the preferred CGM stream with Libre as fallback, preserves heart rate/METs and meal macros, and creates the two challenge streams (`timeseries.csv` and `ehr.csv`).
+The script:
 
-### Synthetic development fallback
+1. Downloads the official CGMacros archive.
+2. Extracts it locally.
+3. Converts it to MetaTwin's five-minute canonical schema.
+4. Runs the leakage-safe research evaluation on a seven-day train / three-day temporal holdout.
+5. Writes final research tables, event metrics, confidence intervals and data provenance.
+6. Commits/pushes only derived research outputs; raw and processed real data stay local.
+7. Runs `railway up` using the already-linked Railway project.
 
-The repository currently ships synthetic development data so the public demo remains lightweight and immediately runnable. Synthetic EHR extensions are explicitly labeled as simulated. **Synthetic metrics must not be presented as real-world validation.** Once CGMacros preprocessing is run, the same modeling/evaluation pipeline can be rerun on the real/open dataset.
+No GitHub/Railway reconnection is required.
 
-## Reproducible research pipeline
+### Manual prerequisite
 
-1. `scripts/prepare_cgmacros.py` — converts the public dataset into MetaTwin's canonical schema.
-2. `scripts/evaluate.py` — trains the forecasting/event models, creates OOF residuals for reliability, calibrates risk, evaluates the temporal holdout and writes research tables.
-3. `src/reliability.py` — implements patient-grouped OOF residual labeling and isotonic calibration.
-4. `api.py` — exposes the clinician inference API and live holdout event metrics.
+The Mac needs Python, `curl`, `unzip`, Git and the existing Railway CLI setup. The repository already contains the Python dependencies used by the backend/evaluation environment.
 
-The failure detector **never uses future glucose as a prediction-time feature**. Future glucose is used only after the forecast to construct the training failure label. Patient-level bootstrap resamples whole patients rather than individual rows.
+## Data policy
+
+The lightweight repository demo continues to use the included synthetic development data for fast deployment. **Synthetic data are clearly development data and must not be presented as clinical validation.** The primary research headline metrics are generated from CGMacros when `scripts/finalize_real_data.sh` is run. Raw CGMacros and participant-level processed files are intentionally excluded from GitHub.
+
+## Reproducibility
+
+- `scripts/prepare_cgmacros.py` — real-data preprocessing.
+- `scripts/evaluate.py` — temporal holdout, forecasting, event prediction, OOF reliability, calibration, abstention and bootstrap evaluation. Set `METATWIN_DATA_ROOT` to evaluate another prepared dataset.
+- `src/reliability.py` — patient-grouped OOF residual reliability detector and second OOF calibration pass.
+- `api.py` — clinician inference API.
 
 ## API
 
-- `GET /api/all` — complete demo payload
-- `GET /api/patient/{id}` — virtual patient inference
-- `GET /api/cohort` — cohort triage
-- `GET /api/event-metrics` — adverse-event and reliability-gated metrics
-- `GET /api/summary` — research summary table
-- `GET /api/abstention` — coverage/error curve
-- `GET /api/calibration` — calibration table
-- `/docs` — FastAPI documentation
+- `GET /api/all` — complete demo payload.
+- `GET /api/patient/{id}` — virtual patient inference.
+- `GET /api/cohort` — cohort triage.
+- `GET /api/event-metrics` — adverse-event and reliability-gated metrics.
+- `GET /api/summary` — research summary.
+- `GET /api/abstention` — coverage/error curve.
+- `GET /api/calibration` — calibration table.
+- `/docs` — FastAPI documentation.
 
 ## Safety boundary
 
-MetaTwin is a research prototype, not a medical device. It does not diagnose, prescribe treatment, recommend medication/dosing, or replace clinician judgment. The what-if layer is a bounded model scenario demonstration, not a causal treatment recommendation. No clinical-validation or population-generalization claim is made.
+MetaTwin is a research prototype, not a medical device. It does not diagnose, prescribe treatment, recommend medication/dosing, or replace clinician judgment. What-if outputs are model scenarios, not causal treatment recommendations. No clinical-validation or population-generalization claim is made.
 
-## Local development
+## Submission checklist
 
-Backend:
-
-```bash
-uvicorn api:app --reload --port 8000
-```
-
-Dashboard:
-
-```bash
-cd dashboard
-npm install
-npm run dev
-```
-
-For deployed frontend use, set `VITE_API_BASE_URL` to the deployed backend URL.
-
-## Submission evidence checklist
-
-- Public GitHub repository: **this repository**
-- Working algorithmic model: **implemented**
-- Two-stream digital twin: **implemented**
-- Specific adverse event + 60-minute window: **implemented**
-- Clinician-facing dashboard: **implemented**
-- Reliability/abstention layer: **implemented**
-- Reproducible real-data preparation: **implemented**
-- Leakage-safe evaluation + patient bootstrap: **implemented**
-- Architecture diagram, presentation and required demonstration video: **submission artifacts to export from the current implementation**
+- Public GitHub repository.
+- Working algorithmic model.
+- Two-stream digital twin.
+- Specific adverse event + 60-minute window.
+- Clinician-facing dashboard.
+- Reliability/abstention layer.
+- Real-data reproducibility pipeline.
+- Leakage-safe evaluation + patient-level bootstrap.
+- Architecture/presentation/demo artifacts can be exported from the implemented project.
 
 ## Team
 
