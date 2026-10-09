@@ -3,18 +3,6 @@
 Raw CGMacros is intentionally NOT committed to GitHub. It is ~627 MB and is
 licensed separately by PhysioNet. Download it from the official source, extract
 it locally, then run this script.
-
-Expected input: a directory containing the extracted CGMacros_dateshifted365
-folder (or its parent), participant CGMacros-XXX folders and bio.csv.
-
-Output:
-  data/processed/timeseries.csv
-  data/processed/ehr.csv
-
-The pipeline keeps only fields needed by MetaTwin, resamples the public
-one-minute series to five minutes, uses Dexcom when available and Libre as a
-fallback, and preserves meal/activity signals. No raw participant files are
-copied into the repository.
 """
 from __future__ import annotations
 
@@ -32,13 +20,8 @@ def _find_bio(root: Path) -> Path:
 
 
 def _find_subject_files(root: Path):
-    files = []
-    for p in root.rglob("*.csv"):
-        name = p.name.lower()
-        if "cgm" in name and p.name.lower() != "bio.csv":
-            files.append(p)
-    # Keep files that contain the CGMacros participant fields.
-    return sorted(files)
+    return sorted(p for p in root.rglob("*.csv")
+                  if "cgm" in p.name.lower() and p.name.lower() != "bio.csv")
 
 
 def _first_col(df, names):
@@ -65,7 +48,6 @@ def _read_subject(path: Path, pid: int) -> pd.DataFrame:
     out = pd.DataFrame({"timestamp": pd.to_datetime(df[ts_col], errors="coerce")})
     dex = _numeric(df[dex_col]) if dex_col else pd.Series(np.nan, index=df.index)
     lib = _numeric(df[lib_col]) if lib_col else pd.Series(np.nan, index=df.index)
-    # Dexcom is sampled at 5 min in the source study; Libre is 15 min.
     out["glucose"] = dex.combine_first(lib)
     out["heart_rate"] = _numeric(df[hr_col]) if hr_col else np.nan
     out["mets"] = (_numeric(df[mets_col]) / 10.0) if mets_col else np.nan
@@ -75,54 +57,41 @@ def _read_subject(path: Path, pid: int) -> pd.DataFrame:
     out["patient_id"] = pid
     out = out.dropna(subset=["timestamp", "glucose"])
     out = out.sort_values("timestamp").drop_duplicates("timestamp")
-    # Five-minute grid keeps the challenge's 60-minute horizon at 12 steps.
-    out = (out.set_index("timestamp")
-             .resample("5min")
-             .agg({"glucose": "mean", "heart_rate": "mean", "mets": "mean",
-                   "meal_carbs": "sum", "meal_protein": "sum", "meal_fat": "sum",
-                   "meal_fiber": "sum", "patient_id": "first"})
-             .reset_index())
-    return out
+    return (out.set_index("timestamp")
+            .resample("5min")
+            .agg({"glucose": "mean", "heart_rate": "mean", "mets": "mean",
+                  "meal_carbs": "sum", "meal_protein": "sum", "meal_fat": "sum",
+                  "meal_fiber": "sum", "patient_id": "first"})
+            .reset_index())
 
 
 def _read_ehr(bio_path: Path) -> pd.DataFrame:
     bio = pd.read_csv(bio_path)
-    # CGMacros participant number is encoded in the first column in the public file.
-    pid_col = _first_col(bio, ["Participant", "Participant ID", "ID", "Subject", "Folder ID"])
+    # The published CGMacros bio table uses `subject` as the participant ID.
+    pid_col = _first_col(bio, ["subject", "Subject", "Participant", "Participant ID", "ID"])
     if pid_col is None:
-        # Fall back to the row order used by the public bio table.
-        bio["patient_id"] = np.arange(1, len(bio) + 1)
-    else:
-        bio["patient_id"] = _numeric(bio[pid_col]).astype("Int64")
-    mapping = {
-        "Age": "age", "Gender": "sex", "BMI": "bmi",
-        "A1c PDL (Lab)": "hba1c", "Fasting GLU - PDL (Lab)": "fasting_glucose",
-    }
-    out = pd.DataFrame({"patient_id": bio["patient_id"]})
-    for src, dst in mapping.items():
-        if src in bio.columns:
-            out[dst] = bio[src]
-        else:
-            out[dst] = np.nan
-    # Prefer measured baseline HR from the subject files; placeholder is filled later.
+        raise ValueError("CGMacros bio.csv must contain its subject identifier column.")
+    out = pd.DataFrame({"patient_id": _numeric(bio[pid_col])})
+    for src, dst in {"Age": "age", "Gender": "sex", "BMI": "bmi",
+                     "A1c PDL (Lab)": "hba1c",
+                     "Fasting GLU - PDL (Lab)": "fasting_glucose"}.items():
+        out[dst] = bio[src] if src in bio.columns else np.nan
     out["baseline_hr"] = np.nan
-    out["patient_id"] = _numeric(out["patient_id"]).astype(int)
+    out["patient_id"] = out.patient_id.astype(int)
     for c in ["age", "bmi", "hba1c", "fasting_glucose"]:
         out[c] = _numeric(out[c])
     out["diabetes_status"] = np.select(
         [out.hba1c < 5.7, out.hba1c <= 6.4],
-        ["healthy", "pre-diabetes"], default="T2D"
-    )
+        ["healthy", "pre-diabetes"], default="T2D")
     return out
 
 
 def prepare(raw_root: Path, output_root: Path):
-    bio_path = _find_bio(raw_root)
+    ehr = _read_ehr(_find_bio(raw_root))
     subject_files = _find_subject_files(raw_root)
     if not subject_files:
         raise FileNotFoundError("No participant CGMacros CSV files were found.")
 
-    ehr = _read_ehr(bio_path)
     frames = []
     for f in subject_files:
         digits = "".join(ch for ch in f.stem if ch.isdigit())
@@ -133,18 +102,15 @@ def prepare(raw_root: Path, output_root: Path):
             frames.append(_read_subject(f, pid))
         except ValueError as exc:
             print(exc)
-
     if not frames:
         raise RuntimeError("No usable participant files were parsed.")
+
     ts = pd.concat(frames, ignore_index=True)
     baseline = ts.dropna(subset=["heart_rate"]).groupby("patient_id").heart_rate.first()
     ehr["baseline_hr"] = ehr.patient_id.map(baseline)
-
-    # Keep only participants for whom both streams exist.
     valid = sorted(set(ts.patient_id.unique()) & set(ehr.patient_id.unique()))
-    ts = ts[ts.patient_id.isin(valid)].copy()
+    ts = ts[ts.patient_id.isin(valid)].copy().sort_values(["patient_id", "timestamp"])
     ehr = ehr[ehr.patient_id.isin(valid)].copy().sort_values("patient_id")
-    ts = ts.sort_values(["patient_id", "timestamp"])
 
     output_root.mkdir(parents=True, exist_ok=True)
     ts.to_csv(output_root / "timeseries.csv", index=False)
