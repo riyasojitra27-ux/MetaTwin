@@ -1,10 +1,10 @@
 """Leakage-safe reliability detector for MetaTwin.
 
 The forecaster is trained on the first seven patient-days. Failure labels are
-created from out-of-fold (OOF) forecasts inside those training days, so the
-failure detector never sees in-sample forecast residuals. Patient groups are
-kept intact in GroupKFold. An isotonic calibrator maps raw failure scores to
-estimated failure probability.
+created from patient-grouped OOF forecasts inside those training days. The
+failure classifier is then trained on those labels, while its isotonic
+calibration is fit on a second patient-grouped OOF pass so calibration does not
+reuse in-sample classifier probabilities.
 """
 from __future__ import annotations
 
@@ -32,24 +32,47 @@ def _new_failure_clf(pos: int, neg: int, seed: int = 42):
     )
 
 
+def _grouped_oof_classifier_scores(d: pd.DataFrame, cols: list[str], seed: int):
+    """OOF classifier probabilities used only to fit the calibrator."""
+    groups = d.patient_id.to_numpy()
+    unique_groups = np.unique(groups)
+    n_splits = min(3, len(unique_groups))
+    if n_splits < 2:
+        raise ValueError("Need at least two patient groups for OOF calibration.")
+    scores = np.full(len(d), np.nan, dtype=float)
+    gkf = GroupKFold(n_splits=n_splits)
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(d, d.failure, groups=groups)):
+        tr = d.iloc[tr_idx]
+        pos = int(tr.failure.sum())
+        neg = int(len(tr) - pos)
+        if pos < 2:
+            raise ValueError("A calibration fold has too few positive failure examples.")
+        model = _new_failure_clf(pos, neg, seed + 100 + fold)
+        model.fit(tr[cols], tr.failure)
+        scores[va_idx] = model.predict_proba(d.iloc[va_idx][cols])[:, 1]
+    return scores
+
+
 def build_oof_failure_detector(train: pd.DataFrame, cols: list[str], horizon: int = 12,
                                 n_splits: int = 3, seed: int = 42):
-    """Return failure model, isotonic calibration and training-only thresholds.
+    """Return final failure model, leakage-safe isotonic calibration and thresholds.
 
     Failure definition: absolute 60-minute forecast error > 30 mg/dL.
     Every residual used as a failure label comes from a patient-held-out OOF
-    forecast. Future glucose is never an input feature to the detector.
+    forecast. The classifier calibrator is also trained from patient-held-out
+    OOF classifier scores. Future glucose is never a prediction-time feature.
     """
     d = train.dropna(subset=cols + ["glucose"]).copy()
     d["target_60"] = d.groupby("patient_id").glucose.shift(-horizon)
     d = d.dropna(subset=["target_60"]).copy()
 
-    groups = d["patient_id"].to_numpy()
+    groups = d.patient_id.to_numpy()
     unique_groups = np.unique(groups)
     n_splits = min(n_splits, len(unique_groups))
     if n_splits < 2:
         raise ValueError("Need at least two patient groups for OOF reliability training.")
 
+    # First OOF layer: obtain leakage-safe forecast residuals.
     oof = np.full(len(d), np.nan, dtype=float)
     gkf = GroupKFold(n_splits=n_splits)
     for fold, (tr_idx, va_idx) in enumerate(gkf.split(d, groups=groups)):
@@ -65,18 +88,18 @@ def build_oof_failure_detector(train: pd.DataFrame, cols: list[str], horizon: in
     if pos < 5:
         raise ValueError("Too few OOF failure examples to train a reliability detector.")
 
+    # Second OOF layer: classifier probabilities are out-of-fold for calibration.
+    calibration_scores = _grouped_oof_classifier_scores(d, cols, seed)
+    calibrator = IsotonicRegression(out_of_bounds="clip")
+    calibrator.fit(calibration_scores, d.failure)
+
+    # Final classifier is trained on all training-only failure labels.
     raw = _new_failure_clf(pos, neg, seed)
     raw.fit(d[cols], d.failure)
-    raw_p = raw.predict_proba(d[cols])[:, 1]
 
-    calibrator = IsotonicRegression(out_of_bounds="clip")
-    calibrator.fit(raw_p, d.failure)
-    calibrated = np.asarray(calibrator.predict(raw_p), dtype=float)
-
-    # Thresholds are selected from training-only calibrated risk. Holdout data
-    # is never used to choose the Forecast/Caution/Abstain boundaries.
-    caution_threshold = float(np.quantile(calibrated, 0.80))
-    abstain_threshold = float(np.quantile(calibrated, 0.95))
+    calibrated_oof = np.asarray(calibrator.predict(calibration_scores), dtype=float)
+    caution_threshold = float(np.quantile(calibrated_oof, 0.80))
+    abstain_threshold = float(np.quantile(calibrated_oof, 0.95))
     abstain_threshold = max(abstain_threshold, caution_threshold + 1e-6)
 
     return raw, calibrator, caution_threshold, abstain_threshold, d
