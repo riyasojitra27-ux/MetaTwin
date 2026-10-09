@@ -1,17 +1,18 @@
 """Leakage-safe MetaTwin research evaluation.
 
-Run after data preparation:
-    python scripts/evaluate.py
+Default: evaluate the lightweight repository dataset.
+Real-data run: METATWIN_DATA_ROOT=data/processed_real python scripts/evaluate.py
 
-The pipeline uses patient-relative time, a seven-day training period and a
-three-day temporal holdout. The reliability detector is trained only from
-patient-grouped OOF forecasting residuals. Bootstrap confidence intervals
-resample whole patients, never individual rows.
+The evaluation uses a seven-day training period and a three-day temporal
+holdout. Reliability labels come from patient-grouped OOF forecast residuals;
+classifier calibration comes from a second patient-grouped OOF pass. Bootstrap
+confidence intervals resample whole patients.
 """
 from __future__ import annotations
 
 from pathlib import Path
 import json
+import os
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (mean_absolute_error, mean_squared_error,
@@ -22,7 +23,7 @@ from xgboost import XGBRegressor, XGBClassifier
 from src.reliability import build_oof_failure_detector, calibrated_failure_probability
 
 BASE = Path(__file__).resolve().parents[1]
-DATA = BASE / "data" / "processed"
+DATA = Path(os.environ.get("METATWIN_DATA_ROOT", str(BASE / "data" / "processed")))
 TABLES = BASE / "results" / "tables"
 H = 12
 SEED = 42
@@ -69,7 +70,9 @@ def train_forecaster(train):
     d = train.dropna(subset=COLS).copy()
     d["target_60"] = d.groupby("patient_id").glucose.shift(-H)
     d = d.dropna(subset=["target_60"])
-    model = XGBRegressor(n_estimators=180, max_depth=5, learning_rate=0.06, subsample=0.9, colsample_bytree=0.9, random_state=SEED, objective="reg:squarederror", n_jobs=2)
+    model = XGBRegressor(n_estimators=180, max_depth=5, learning_rate=0.06,
+                         subsample=0.9, colsample_bytree=0.9, random_state=SEED,
+                         objective="reg:squarederror", n_jobs=2)
     model.fit(d[COLS], d.target_60)
     return model
 
@@ -77,15 +80,16 @@ def train_forecaster(train):
 def train_event_model(train):
     d = train.dropna(subset=COLS + ["event"]).copy()
     pos = max(1, int(d.event.sum())); neg = max(1, len(d) - pos)
-    model = XGBClassifier(n_estimators=140, max_depth=4, learning_rate=0.06, subsample=0.9, colsample_bytree=0.9, random_state=SEED, eval_metric="logloss", n_jobs=2, scale_pos_weight=neg / pos)
+    model = XGBClassifier(n_estimators=140, max_depth=4, learning_rate=0.06,
+                          subsample=0.9, colsample_bytree=0.9, random_state=SEED,
+                          eval_metric="logloss", n_jobs=2, scale_pos_weight=neg / pos)
     model.fit(d[COLS], d.event.astype(int))
     return model
 
 
 def patient_bootstrap(df, pred_col, target_col, metric_fn, n=1000, seed=SEED):
     rng = np.random.default_rng(seed)
-    pids = df.patient_id.unique()
-    values = []
+    pids = df.patient_id.unique(); values = []
     for _ in range(n):
         sampled = rng.choice(pids, size=len(pids), replace=True)
         b = pd.concat([df[df.patient_id == pid] for pid in sampled], ignore_index=True)
@@ -101,6 +105,9 @@ def event_stats(y, pred, rows_per_day=288):
 
 def main():
     x = load_data(); train = x[x.day < 7].copy(); hold = x[x.day >= 7].copy()
+    if x.patient_id.nunique() < 10:
+        raise ValueError("Evaluation requires at least 10 patients.")
+
     reg = train_forecaster(train)
     hold_reg = hold.dropna(subset=COLS).copy()
     hold_reg["actual_60"] = hold_reg.groupby("patient_id").glucose.shift(-H)
@@ -129,7 +136,7 @@ def main():
     auprc = average_precision_score(y_fail, p_fail) if y_fail.sum() else float("nan")
 
     y = hold_event.event.to_numpy().astype(int); ungated = hold_event.event_prediction.to_numpy().astype(int); gated = hold_event.gated_prediction.to_numpy().astype(int)
-    event_metrics = {"window_minutes": 60, "definition": "glucose >180 mg/dL or <70 mg/dL within 60 minutes", "without_gating": event_stats(y, ungated), "with_reliability_gating": event_stats(y, gated), "failure_detector_auroc": float(auroc), "failure_detector_auprc": float(auprc), "reliability_thresholds": {"caution": caution_t, "abstain": abstain_t}, "trust_coverage": {s: float((hold_event.trust_state == s).mean() * 100) for s in ["Forecast", "Caution", "Abstain"]}}
+    event_metrics = {"window_minutes": 60, "event_definition": "glucose >180 mg/dL or <70 mg/dL within 60 minutes", "without_gating": event_stats(y, ungated), "with_reliability_gating": event_stats(y, gated), "failure_detector_auroc": float(auroc), "failure_detector_auprc": float(auprc), "reliability_thresholds": {"caution": caution_t, "abstain": abstain_t}, "trust_coverage": {s: float((hold_event.trust_state == s).mean() * 100) for s in ["Forecast", "Caution", "Abstain"]}, "validation": "temporal holdout; patient-grouped OOF reliability training and calibration", "dataset_root": str(DATA)}
 
     rng = np.random.default_rng(SEED); pids = hold_event.patient_id.unique(); boot = {"precision": [], "recall": [], "f1": []}
     for _ in range(1000):
@@ -149,21 +156,22 @@ def main():
     calibration = cal.groupby("bin").agg(predicted=("event_probability", "mean"), observed=("event", "mean")).reset_index(drop=True)
 
     TABLES.mkdir(parents=True, exist_ok=True)
+    dataset_label = "CGMacros v1.0.0" if DATA.name == "processed_real" else "synthetic development data"
     rows = [
-        {"metric": "data_patients", "value": int(x.patient_id.nunique())}, {"metric": "data_observations", "value": int(len(x))},
+        {"metric": "dataset", "value": dataset_label}, {"metric": "data_patients", "value": int(x.patient_id.nunique())}, {"metric": "data_observations", "value": int(len(x))},
         {"metric": "mae_persistence", "value": p_mae}, {"metric": "mae_xgboost", "value": mae, "ci_low": mae_ci[0], "ci_high": mae_ci[1]},
         {"metric": "rmse_persistence", "value": p_rmse}, {"metric": "rmse_xgboost", "value": rmse_value, "ci_low": rmse_ci[0], "ci_high": rmse_ci[1]},
         {"metric": "auroc_failure", "value": auroc}, {"metric": "auprc_failure", "value": auprc}, {"metric": "failure_prevalence", "value": float(y_fail.mean())},
         {"metric": "event_precision", "value": event_metrics["without_gating"]["precision"], "ci_low": event_ci["precision"][0], "ci_high": event_ci["precision"][1]},
         {"metric": "event_recall", "value": event_metrics["without_gating"]["recall"], "ci_low": event_ci["recall"][0], "ci_high": event_ci["recall"][1]},
         {"metric": "event_f1", "value": event_metrics["without_gating"]["f1"], "ci_low": event_ci["f1"][0], "ci_high": event_ci["f1"][1]},
-        {"metric": "gated_precision", "value": event_metrics["with_reliability_gating"]["precision"]}, {"metric": "gated_recall", "value": event_metrics["with_reliability_gating"]["recall"]},
-        {"metric": "gated_f1", "value": event_metrics["with_reliability_gating"]["f1"]}, {"metric": "gated_false_alarms_per_day", "value": event_metrics["with_reliability_gating"]["false_alarms_per_day"]},
+        {"metric": "gated_precision", "value": event_metrics["with_reliability_gating"]["precision"]}, {"metric": "gated_recall", "value": event_metrics["with_reliability_gating"]["recall"]}, {"metric": "gated_f1", "value": event_metrics["with_reliability_gating"]["f1"]}, {"metric": "gated_false_alarms_per_day", "value": event_metrics["with_reliability_gating"]["false_alarms_per_day"]},
     ]
     pd.DataFrame(rows).to_csv(TABLES / "model_summary.csv", index=False); pd.DataFrame(abst).to_csv(TABLES / "abstention_curve.csv", index=False); calibration.to_csv(TABLES / "calibration.csv", index=False)
-    (TABLES / "event_metrics.json").write_text(json.dumps(event_metrics, indent=2))
+    (TABLES / "event_metrics.json").write_text(json.dumps(event_metrics, indent=2)); (TABLES / "event_metrics_ci.json").write_text(json.dumps(event_ci, indent=2))
+    (TABLES / "data_provenance.json").write_text(json.dumps({"dataset": dataset_label, "source": "PhysioNet CGMacros v1.0.0" if DATA.name == "processed_real" else "repository synthetic development generator", "patients": int(x.patient_id.nunique()), "observations": int(len(x)), "training_days": 7, "holdout_days": 3, "forecast_horizon_minutes": 60, "event_definition": ">180 mg/dL or <70 mg/dL within 60 minutes", "failure_definition": "absolute 60-minute forecast error >30 mg/dL", "reliability": "patient-grouped OOF residuals + second grouped OOF classifier calibration + isotonic regression", "bootstrap": "1000 patient-level resamples, 95% percentile intervals", "raw_data_committed": False}, indent=2))
     (TABLES / "reliability_thresholds.json").write_text(json.dumps({"caution": caution_t, "abstain": abstain_t, "method": "training-only 80th/95th quantiles of calibrated OOF failure risk"}, indent=2))
-    print(json.dumps({"forecast": {"mae": mae, "rmse": rmse_value}, "event": event_metrics, "event_ci": event_ci}, indent=2))
+    print(json.dumps({"forecast": {"mae": mae, "rmse": rmse_value, "mae_ci": mae_ci, "rmse_ci": rmse_ci}, "event": event_metrics, "event_ci": event_ci}, indent=2))
 
 
 if __name__ == "__main__": main()
