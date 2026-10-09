@@ -12,7 +12,7 @@ BASE = Path(__file__).parent
 TABLES = BASE / "results" / "tables"
 DATA = BASE / "data" / "processed"
 H = 12
-app = FastAPI(title="MetaTwin API", description="Glucose digital twin: forecast, adverse-event prediction and reliability gating", version="0.2.1")
+app = FastAPI(title="MetaTwin API", description="Glucose digital twin: forecast, adverse-event prediction and reliability gating", version="0.2.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -54,6 +54,13 @@ def build_models():
     dynamic = ["glucose", "heart_rate", "mets", "meal_carbs", "meal_protein", "meal_fat", "meal_fiber", "glucose_slope", "glucose_mean_30", "glucose_std_30", "hour_sin", "hour_cos"]
     static = ["age", "bmi", "hba1c", "fasting_glucose", "baseline_hr"]
     cols = dynamic + static
+
+    # The processed CSVs can contain numeric-looking values stored as object/string
+    # dtype. XGBoost requires numeric feature dtypes, so normalize every model
+    # feature explicitly before training, holdout evaluation, and inference.
+    for c in cols:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+
     usable = x.dropna(subset=cols + ["future_max", "future_min"]).copy()
     train = usable[usable.day < 7].copy()
     reg_target = train.groupby("patient_id").glucose.shift(-H)
@@ -82,8 +89,13 @@ def _enriched_ehr(row):
 def _patient_payload(pid):
     x,ehr,cols,reg,clf=build_models(); rows=x[(x.patient_id==pid)&(x.day>=7)].copy()
     if rows.empty: raise HTTPException(404,"Patient not found")
-    row=rows.iloc[min(100,max(0,len(rows)-H-1))]; feats=row[cols].to_frame().T
-    forecast=float(reg.predict(feats)[0]); event_prob=float(clf.predict_proba(feats)[0,1]); current=float(row.glucose); slope=float(row.glucose_slope if pd.notna(row.glucose_slope) else 0)
+    row=rows.iloc[min(100,max(0,len(rows)-H-1))]
+    feats=row[cols].to_frame().T.copy()
+    for c in cols:
+        feats[c] = pd.to_numeric(feats[c], errors="coerce")
+    if feats[cols].isna().any().any():
+        raise HTTPException(500,"Model features contain missing or non-numeric values")
+    forecast=float(reg.predict(feats[cols])[0]); event_prob=float(clf.predict_proba(feats[cols])[0,1]); current=float(row.glucose); slope=float(row.glucose_slope if pd.notna(row.glucose_slope) else 0)
     points=[current+(forecast-current)*(i/H) for i in range(H+1)]
     future_max=float(row.future_max); future_min=float(row.future_min)
     if forecast>=180: event_type="Hyperglycemic event"
@@ -121,7 +133,11 @@ def cohort():
     return out
 @app.get("/api/event-metrics")
 def event_metrics():
-    x,_,cols,_,clf=build_models(); hold=x[x.day>=7].dropna(subset=cols+["event"]).copy(); proba=clf.predict_proba(hold[cols])[:,1]; pred=(proba>=0.5).astype(int); risk=np.clip(0.25+hold.glucose_std_30.fillna(0).to_numpy()/50+hold.glucose_slope.abs().fillna(0).to_numpy()/30,0.02,0.98); gated_pred=((proba>=0.5)&(risk<0.72)).astype(int); y=hold.event.astype(int).to_numpy()
+    x,_,cols,_,clf=build_models(); hold=x[x.day>=7].dropna(subset=cols+["event"]).copy()
+    for c in cols:
+        hold[c] = pd.to_numeric(hold[c], errors="coerce")
+    hold = hold.dropna(subset=cols)
+    proba=clf.predict_proba(hold[cols])[:,1]; pred=(proba>=0.5).astype(int); risk=np.clip(0.25+hold.glucose_std_30.fillna(0).to_numpy()/50+hold.glucose_slope.abs().fillna(0).to_numpy()/30,0.02,0.98); gated_pred=((proba>=0.5)&(risk<0.72)).astype(int); y=hold.event.astype(int).to_numpy()
     def stats(p):
         tn,fp,fn,tp=confusion_matrix(y,p,labels=[0,1]).ravel(); return {"precision":float(precision_score(y,p,zero_division=0)),"recall":float(recall_score(y,p,zero_division=0)),"f1":float(f1_score(y,p,zero_division=0)),"false_alarms":int(fp),"true_positives":int(tp),"events":int(y.sum()),"samples":int(len(y))}
     return {"window_minutes":60,"event_definition":"glucose >180 mg/dL or <70 mg/dL within 60 minutes","without_gating":stats(pred),"with_reliability_gating":stats(gated_pred),"validation":"temporal holdout on synthetic development data"}
