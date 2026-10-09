@@ -4,198 +4,105 @@ import './styles.css';
 
 type Summary = Record<string, number>;
 type Curve = Record<string, unknown>[];
-type AllData = { summary: Summary; abstention: Curve; calibration: Curve };
+type Patient = {
+  patient: Record<string, any>; data_streams: { dynamic: string[]; static: string[] };
+  current: { timestamp: string; glucose: number; heart_rate: number; mets: number; carbs_recent: number; trend: number };
+  forecast: { horizon_minutes: number; endpoint_glucose: number; points: number[] };
+  event: { type: string; probability: number; thresholds: { high: number; low: number }; window_minutes: number; alert_candidate: boolean; gated_by_reliability: boolean; actual_future_max: number; actual_future_min: number };
+  reliability: { state: string; failure_risk: number; reason_codes: string[] };
+  what_if: { id: string; label: string; delta_carbs: number; enabled: boolean }[];
+  research_note: string;
+};
+type EventMetrics = { without_gating: Record<string, number>; with_reliability_gating: Record<string, number>; validation: string; event_definition: string };
+type AllData = { summary: Summary; abstention: Curve; calibration: Curve; patient: Patient; event_metrics: EventMetrics };
+type Tab = 'clinician' | 'events' | 'reliability' | 'whatif' | 'cohort' | 'research' | 'model';
 
 const API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/$/, '');
 
-function metric(v: unknown, digits = 1) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n.toFixed(digits) : '—';
-}
+function metric(v: unknown, digits = 1) { const n = Number(v); return Number.isFinite(n) ? n.toFixed(digits) : '—'; }
+function pct(v: number) { return `${Math.round(v * 100)}%`; }
 
 function TwinFigure({ active }: { active: boolean }) {
   const dots = useMemo(() => Array.from({ length: 170 }, (_, i) => {
-    const t = i / 169;
-    const y = 5 + t * 90;
-    const center = 50 + Math.sin(t * Math.PI * 2) * 1.2;
+    const t = i / 169; const y = 5 + t * 90; const center = 50 + Math.sin(t * Math.PI * 2) * 1.2;
     const width = t < .14 ? 7 + t * 18 : t < .3 ? 10 + (t - .14) * 34 : t < .62 ? 20 : t < .8 ? 18 - (t - .62) * 20 : 7;
     const x = center + (Math.sin(i * 17.13) * .52 + Math.sin(i * 4.77) * .48) * width;
     return { x, y, s: 1 + (i % 4) * .35, delay: (i % 19) * .07 };
   }), []);
+  return <div className={`twin-figure ${active ? 'is-active' : ''}`} aria-label="Particle representation of the MetaTwin digital twin">
+    <div className="twin-glow" />{dots.map((d, i) => <span key={i} className="twin-particle" style={{ left: `${d.x}%`, top: `${d.y}%`, width: d.s, height: d.s, animationDelay: `${d.delay}s` }} />)}
+    <div className="heart-orbit"><span /></div><div className="center-point" />
+  </div>;
+}
 
-  return (
-    <div className={`twin-figure ${active ? 'is-active' : ''}`} aria-label="Particle representation of the MetaTwin digital twin">
-      <div className="twin-glow" />
-      {dots.map((d, i) => <span key={i} className="twin-particle" style={{ left: `${d.x}%`, top: `${d.y}%`, width: d.s, height: d.s, animationDelay: `${d.delay}s` }} />)}
-      <div className="heart-orbit"><span /></div>
-      <div className="center-point" />
-    </div>
-  );
+function ForecastChart({ points }: { points: number[] }) {
+  const w = 720, h = 250, pad = 28; const min = Math.min(50, ...points) - 5; const max = Math.max(200, ...points) + 10;
+  const xy = (v: number, i: number) => [pad + i * ((w - pad * 2) / (points.length - 1)), h - pad - ((v - min) / (max - min)) * (h - pad * 2)];
+  const path = points.map((v, i) => { const [x, y] = xy(v, i); return `${i ? 'L' : 'M'} ${x.toFixed(1)} ${y.toFixed(1)}`; }).join(' ');
+  const highY = h - pad - ((180 - min) / (max - min)) * (h - pad * 2); const lowY = h - pad - ((70 - min) / (max - min)) * (h - pad * 2);
+  return <div className="forecast-chart"><svg viewBox={`0 0 ${w} ${h}`} role="img" aria-label="60 minute glucose forecast">
+    <line x1={pad} x2={w-pad} y1={highY} y2={highY} className="threshold high"/><line x1={pad} x2={w-pad} y1={lowY} y2={lowY} className="threshold low"/>
+    <text x={w-pad} y={highY-6} textAnchor="end">180 high</text><text x={w-pad} y={lowY+16} textAnchor="end">70 low</text>
+    <path d={path} className="forecast-line"/><circle cx={xy(points[0],0)[0]} cy={xy(points[0],0)[1]} r="5" className="forecast-dot"/><circle cx={xy(points.at(-1)!,points.length-1)[0]} cy={xy(points.at(-1)!,points.length-1)[1]} r="5" className="forecast-dot"/>
+    <text x={pad} y={h-5}>Now</text><text x={w-pad} y={h-5} textAnchor="end">+60 min</text>
+  </svg></div>;
 }
 
 function App() {
-  const [data, setData] = useState<AllData | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
-  const [tab, setTab] = useState<'clinician' | 'trust' | 'research'>('clinician');
+  const [data, setData] = useState<AllData | null>(null); const [cohort, setCohort] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true); const [error, setError] = useState(''); const [tab, setTab] = useState<Tab>('clinician'); const [riskCut, setRiskCut] = useState(50);
+  const load = async () => { setLoading(true); setError(''); try { const r = await fetch(`${API}/api/all`); if (!r.ok) throw new Error(`API returned ${r.status}`); setData(await r.json()); } catch(e) { setError(e instanceof Error ? e.message : 'Unable to connect to MetaTwin API'); } finally { setLoading(false); } };
+  const loadCohort = async () => { try { const r = await fetch(`${API}/api/cohort`); if (r.ok) setCohort(await r.json()); } catch {} };
+  useEffect(() => { load(); loadCohort(); }, []);
+  const s = data?.summary || {}; const p = data?.patient; const em = data?.event_metrics;
+  const trust = p?.reliability.state || '—';
+  const gain = Number(s.mae_persistence) && Number(s.mae_xgboost) ? ((Number(s.mae_persistence)-Number(s.mae_xgboost))/Number(s.mae_persistence))*100 : NaN;
 
-  const load = async () => {
-    setLoading(true); setError('');
-    try {
-      const response = await fetch(`${API}/api/all`);
-      if (!response.ok) throw new Error(`API returned ${response.status}`);
-      setData(await response.json());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to connect to MetaTwin API');
-    } finally { setLoading(false); }
-  };
+  const nav: [Tab,string][] = [['clinician','Clinician'],['events','Events'],['reliability','Reliability'],['whatif','What-If'],['cohort','Cohort'],['research','Research'],['model','Model Card']];
+  return <main>
+    <header className="topbar"><div className="wordmark">MetaTwin<span>.</span></div><div className="topbar-right"><span className="research-status"><i /> Clinician-facing research prototype</span><button className="refresh" onClick={load}>Refresh</button></div></header>
+    <section className="hero">
+      <div className="hero-copy"><p className="kicker">GLUCOSE DIGITAL TWIN · CLINICIAN VIEW</p><h1>MetaTwin</h1><h2>Predict glucose events.<br/><span>Measure reliability.</span><br/>Know when to abstain.</h2>
+        <p className="lede">Static EHR + dynamic CGM, wearable and meal signals are fused into a virtual patient that forecasts near-term glucose and evaluates whether an adverse-event prediction is reliable enough to surface.</p>
+        <div className="hero-actions"><button className="primary-action" onClick={() => setTab('clinician')}>Open virtual patient <span>↓</span></button><span className="hero-note">Event window · 60 min · &gt;180 / &lt;70 mg/dL</span></div>
+      </div>
+      <div className="twin-stage"><div className="stage-grid"/><div className="stage-caption"><span>VIRTUAL PATIENT</span><b>{loading ? 'CONNECTING' : error ? 'OFFLINE' : 'ACTIVE'}</b></div><TwinFigure active={!loading && !error}/>
+        <div className="trust-core"><small>FORECAST RELIABILITY</small><strong>{trust}</strong><span>Failure risk {p ? pct(p.reliability.failure_risk) : '—'}</span></div>
+        <div className="data-node node-one"><small>EVENT WINDOW</small><strong>60 min</strong></div><div className="data-node node-two"><small>FORECAST</small><strong>{p ? `${metric(p.forecast.endpoint_glucose)} mg/dL` : '—'}</strong></div>
+        <div className="data-node node-three"><small>EVENT RISK</small><strong>{p ? pct(p.event.probability) : '—'}</strong></div><div className="data-node node-four"><small>TRUST STATE</small><strong>{trust}</strong></div>
+      </div>
+    </section>
+    <nav className="section-nav">{nav.map(([id,label]) => <button key={id} className={tab===id?'active':''} onClick={()=>setTab(id)}>{label}</button>)}</nav>
+    {error && <section className="error-banner"><strong>Model API unavailable.</strong> {error}<button onClick={load}>Try again</button></section>}
 
-  useEffect(() => { load(); }, []);
-
-  const summary = data?.summary || {};
-  const persistence = Number(summary.mae_persistence);
-  const xgbMae = Number(summary.mae_xgboost);
-  const gain = persistence && xgbMae ? ((persistence - xgbMae) / persistence) * 100 : NaN;
-  const reliability = Number(summary.auroc_failure);
-  const trust = reliability >= .75 ? 'Forecast' : reliability >= .6 ? 'Caution' : 'Abstain';
-
-  return (
-    <main>
-      <header className="topbar">
-        <div className="wordmark">MetaTwin<span>.</span></div>
-        <div className="topbar-right">
-          <span className="research-status"><i /> Clinician-facing research prototype</span>
-          <button className="refresh" onClick={load}>Refresh data</button>
+    {tab==='clinician' && p && <section className="content">
+      <div className="section-intro"><div><p className="kicker">01 · VIRTUAL PATIENT</p><h3>One patient. One forecast. One trust decision.</h3></div><p>The clinician sees the patient context, live state, 60-minute forecast, adverse-event risk and reliability gate together.</p></div>
+      <div className="patient-shell"><div className="patient-header"><div><small>VIRTUAL PATIENT</small><strong>Patient {String(p.patient.patient_id).padStart(3,'0')}</strong><span>{p.patient.diabetes_status} · synthetic development cohort</span></div><div className={`state-pill ${trust.toLowerCase()}`}>{trust}</div></div>
+        <div className="patient-grid">
+          <article className="patient-card profile-card"><p className="kicker">PATIENT CONTEXT</p><h4>Static EHR stream</h4><div className="profile-grid">{[['Age',p.patient.age],['Sex',p.patient.sex],['BMI',p.patient.bmi],['HbA1c',p.patient.hba1c],['Status',p.patient.diabetes_status],['Baseline HR',`${p.patient.baseline_hr} bpm`]].map(([k,v])=><div key={String(k)}><small>{k}</small><b>{v}</b></div>)}</div><div className="simulated-note">Extended diagnoses, labs and genetic risk are explicitly marked simulated.</div></article>
+          <article className="patient-card live-card"><p className="kicker">DYNAMIC STATE · {new Date(p.current.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}</p><div className="live-grid">{[['Glucose',`${metric(p.current.glucose)} mg/dL`],['Heart rate',`${metric(p.current.heart_rate)} bpm`],['Activity',`${metric(p.current.mets,2)} METs`],['Recent carbs',`${metric(p.current.carbs_recent)} g`],['Trend',`${p.current.trend>=0?'↑':'↓'} ${metric(Math.abs(p.current.trend),2)} mg/dL/min`]].map(([k,v])=><div key={String(k)}><small>{k}</small><strong>{v}</strong></div>)}</div></article>
         </div>
-      </header>
+      </div>
+      <div className="forecast-panel"><div className="panel-heading"><div><p className="kicker">02 · GLUCOSE FORECAST</p><h4>Next 60 minutes</h4></div><div className="forecast-end"><small>MODEL ENDPOINT</small><strong>{metric(p.forecast.endpoint_glucose)} <em>mg/dL</em></strong></div></div><ForecastChart points={p.forecast.points}/></div>
+      <div className="event-decision"><div className="event-main"><p className="kicker">03 · ADVERSE EVENT PREDICTION</p><h4>{p.event.type}</h4><div className="event-risk"><strong>{pct(p.event.probability)}</strong><span>model probability</span></div><p>Definition: glucose <b>&gt;180</b> or <b>&lt;70 mg/dL</b> within {p.event.window_minutes} minutes.</p></div><div className="gate"><small>RELIABILITY GATE</small><strong>{p.event.alert_candidate ? 'ALERT SURFACED' : 'ALERT WITHHELD'}</strong><span>Trust state: {trust}</span><button onClick={()=>setTab('reliability')}>Inspect why →</button></div></div>
+      <div className="clinical-flow"><article><span>01</span><b>Patient data</b><p>CGM + wearable + meals + EHR</p></article><div className="flow-arrow">→</div><article><span>02</span><b>Digital twin</b><p>Personalized state + trajectory</p></article><div className="flow-arrow">→</div><article><span>03</span><b>Event prediction</b><p>&gt;180 / &lt;70 within 60 min</p></article><div className="flow-arrow">→</div><article><span>04</span><b>Reliability gate</b><p>Forecast · Caution · Abstain</p></article></div>
+      <div className="clinical-boundary"><strong>Research boundary</strong><span>MetaTwin is a research prototype. It does not diagnose, prescribe treatment or replace clinical judgment.</span></div>
+    </section>}
 
-      <section className="hero">
-        <div className="hero-copy">
-          <p className="kicker">GLUCOSE DIGITAL TWIN · CLINICIAN VIEW</p>
-          <h1>MetaTwin</h1>
-          <h2>Predict glucose events.<br /><span>Measure reliability.</span><br />Know when to abstain.</h2>
-          <p className="lede">
-            A virtual patient that combines <strong>dynamic glucose, wearable and meal signals</strong> with <strong>static EHR context</strong> to forecast near-term glucose events and show how reliable that forecast is.
-          </p>
-          <div className="hero-actions">
-            <button className="primary-action" onClick={() => setTab('clinician')}>Open clinician view <span>↓</span></button>
-            <span className="hero-note">Adverse event window · 60 min · research prototype</span>
-          </div>
-        </div>
+    {tab==='events' && p && <section className="content"><div className="section-intro single"><div><p className="kicker">03 · ADVERSE EVENTS</p><h3>Predict the event the challenge asks for.</h3></div></div><div className="event-hero"><div><small>60-MINUTE EVENT RISK</small><strong>{pct(p.event.probability)}</strong><h4>{p.event.type}</h4><p>Thresholds: &gt;180 mg/dL hyperglycemia · &lt;70 mg/dL hypoglycemia</p></div><div className="event-gate"><small>RELIABILITY-GATED DECISION</small><strong>{p.event.alert_candidate ? 'SURFACE ALERT' : 'WITHHOLD ALERT'}</strong><span>{trust} · failure risk {pct(p.reliability.failure_risk)}</span></div></div><div className="threshold-grid"><article><b>180 mg/dL</b><span>upper event threshold</span></article><article><b>70 mg/dL</b><span>lower event threshold</span></article><article><b>60 min</b><span>prediction window</span></article><article><b>{pct(p.event.probability)}</b><span>current event probability</span></article></div>{em && <div className="comparison"><h4>Event gating evaluation</h4><div className="compare-grid"><div><small>WITHOUT GATING</small><b>{pct(em.without_gating.precision)}</b><span>precision</span><b>{pct(em.without_gating.recall)}</b><span>recall</span></div><div className="highlight-box"><small>WITH RELIABILITY GATING</small><b>{pct(em.with_reliability_gating.precision)}</b><span>precision</span><b>{pct(em.with_reliability_gating.recall)}</b><span>recall</span></div></div></div>}</section>}
 
-        <div className="twin-stage">
-          <div className="stage-grid" />
-          <div className="stage-caption"><span>VIRTUAL PATIENT</span><b>{loading ? 'CONNECTING' : error ? 'OFFLINE' : 'ACTIVE'}</b></div>
-          <TwinFigure active={!loading && !error} />
-          <div className="trust-core">
-            <small>FORECAST RELIABILITY</small>
-            <strong>{loading ? '—' : error ? 'Offline' : trust}</strong>
-            <span>AUROC {metric(summary.auroc_failure, 2)}</span>
-          </div>
-          <div className="data-node node-one"><small>EVENT WINDOW</small><strong>60 min</strong></div>
-          <div className="data-node node-two"><small>FORECAST ERROR</small><strong>{metric(summary.mae_xgboost)} <em>mg/dL MAE</em></strong></div>
-          <div className="data-node node-three"><small>ADVERSE EVENT</small><strong>&gt;180 / &lt;70</strong></div>
-          <div className="data-node node-four"><small>RELIABILITY</small><strong>{loading || error ? '—' : trust}</strong></div>
-        </div>
-      </section>
+    {tab==='reliability' && p && <section className="content"><div className="section-intro single"><div><p className="kicker">04 · RELIABILITY LAYER</p><h3>MetaTwin can say “I don't trust this forecast.”</h3></div></div><div className="reliability-layout"><div className={`trust-big ${trust.toLowerCase()}`}><small>CURRENT TRUST STATE</small><strong>{trust}</strong><span>Failure risk {pct(p.reliability.failure_risk)}</span></div><div className="reason-panel"><p className="kicker">REASON CODES</p><h4>Why is reliability {trust.toLowerCase()}?</h4>{p.reliability.reason_codes.map((r,i)=><div className="reason" key={i}><span>{i+1}</span>{r}</div>)}</div></div><div className="reliability-steps">{[['Forecast','Estimate glucose trajectory'],['Failure detector','Estimate when the forecast may be wrong'],['Event gate','Control whether the event alert is surfaced'],['Abstain','Avoid false certainty when evidence is insufficient']].map(([a,b],i)=><article key={a}><small>0{i+1}</small><b>{a}</b><p>{b}</p></article>)}</div><div className="slider-panel"><div><p className="kicker">DOCTOR'S RISK SLIDER</p><h4>Choose how much uncertainty to tolerate</h4></div><input type="range" min="0" max="50" value={riskCut} onChange={e=>setRiskCut(Number(e.target.value))}/><div className="slider-readout"><strong>{riskCut}%</strong><span>maximum abstention preference · demonstration control</span></div></div></section>}
 
-      <nav className="section-nav">
-        <button className={tab === 'clinician' ? 'active' : ''} onClick={() => setTab('clinician')}>Clinician view</button>
-        <button className={tab === 'trust' ? 'active' : ''} onClick={() => setTab('trust')}>Reliability layer</button>
-        <button className={tab === 'research' ? 'active' : ''} onClick={() => setTab('research')}>Research evidence</button>
-      </nav>
+    {tab==='whatif' && p && <section className="content"><div className="section-intro single"><div><p className="kicker">05 · CONDITIONAL SIMULATION</p><h3>What if the context changed?</h3></div></div><div className="whatif-note">{trust==='Abstain' ? 'Simulation disabled — current forecast reliability is insufficient.' : 'Simulation enabled because the current reliability state is not Abstain. These scenarios are demonstrations, not causal claims.'}</div><div className="scenario-grid">{p.what_if.map(w=><article className={!w.enabled?'disabled':''} key={w.id}><small>{w.id.replace('_',' ').toUpperCase()}</small><h4>{w.label}</h4><div className="scenario-line">{w.enabled ? 'Bounded scenario available' : 'Disabled by reliability gate'}</div><p>{w.id==='walk_20'?'Activity context: 20-minute walk':w.id==='reduced_carbs'?'Meal context: 20% lower carbohydrate intake':'Current observed context'}</p></article>)}</div></section>}
 
-      {error && <section className="error-banner"><div><strong>Model API unavailable.</strong> {error}</div><button onClick={load}>Try again</button></section>}
+    {tab==='cohort' && <section className="content"><div className="section-intro single"><div><p className="kicker">06 · COHORT TRIAGE</p><h3>Which virtual patients need attention?</h3></div></div><div className="cohort-table"><div className="cohort-head"><span>Patient</span><span>Status</span><span>Event risk</span><span>Reliability</span><span>Decision</span></div>{cohort.map(c=><div className="cohort-row" key={c.patient_id}><b>P{String(c.patient_id).padStart(3,'0')}</b><span>{c.status}</span><strong>{pct(c.event_probability)}</strong><span className={`mini-state ${String(c.reliability).toLowerCase()}`}>{c.reliability}</span><span>{c.alert?'Alert':'Monitor'}</span></div>)}</div></section>}
 
-      {tab === 'clinician' && (
-        <section className="content">
-          <div className="section-intro">
-            <div><p className="kicker">01 · VIRTUAL PATIENT</p><h3>What should the clinician see?</h3></div>
-            <p>The dashboard is centered on the required clinical event: glucose crossing 180 mg/dL or 70 mg/dL within the prediction window.</p>
-          </div>
+    {tab==='research' && <section className="content"><div className="section-intro single"><div><p className="kicker">07 · RESEARCH EVIDENCE</p><h3>Separate the clinical story from the evidence.</h3></div></div><div className="metrics"><article><small>PERSISTENCE MAE</small><strong>{metric(s.mae_persistence)}</strong><span>mg/dL</span></article><article className="highlight"><small>XGBOOST MAE</small><strong>{metric(s.mae_xgboost)}</strong><span>mg/dL · {Number.isFinite(gain)?`${metric(gain)}% below baseline`:''}</span></article><article><small>XGBOOST RMSE</small><strong>{metric(s.rmse_xgboost)}</strong><span>mg/dL</span></article><article><small>FAILURE AUROC</small><strong>{metric(s.auroc_failure,2)}</strong><span>reliability detector</span></article></div><div className="evidence-grid"><article><p className="kicker">ABSTENTION</p><h4>Coverage → error trade-off</h4><p>Use the precomputed abstention curve to compare learned, random and oracle strategies in the final evaluation.</p></article><article><p className="kicker">CALIBRATION</p><h4>Probability should mean something</h4><p>Reliability diagrams and Brier score belong here once the final calibrated detector results are generated.</p></article><article><p className="kicker">EVENT GATING</p><h4>Alert quality with vs without gating</h4><p>{em ? `${pct(em.with_reliability_gating.precision)} precision with reliability gating in the current temporal-holdout demonstration.` : 'Loading event evaluation…'}</p></article></div><div className="research-callout"><strong>Validation status</strong><span>Current patient/event inference is a temporal-holdout development demonstration. Final headline claims should use OOF residuals, patient-level bootstrap confidence intervals and the completed CGMacros experiment when available.</span></div></section>}
 
-          <div className="patient-shell">
-            <div className="patient-header">
-              <div><small>VIRTUAL PATIENT</small><strong>Patient 01 · Synthetic cohort</strong><span>Digital twin assembled from dynamic + static patient data</span></div>
-              <div className="patient-state"><small>MODEL STATE</small><b>{loading ? 'Connecting' : error ? 'Offline' : 'Active'}</b></div>
-            </div>
-            <div className="patient-grid">
-              <article className="patient-card profile-card">
-                <p className="kicker">PATIENT CONTEXT</p>
-                <h4>Two-stream patient representation</h4>
-                <div className="stream-row"><span>Dynamic</span><b>CGM · HR · activity · meals</b></div>
-                <div className="stream-row"><span>Static EHR</span><b>Age · BMI · HbA1c · diagnoses</b></div>
-                <div className="stream-row"><span>Twin goal</span><b>Forecast near-term glucose</b></div>
-              </article>
+    {tab==='model' && <section className="content"><div className="section-intro single"><div><p className="kicker">08 · MODEL CARD</p><h3>Transparent by design.</h3></div></div><div className="model-card-grid">{[['Intended use','Research prototype for glucose forecasting, adverse-event prediction and forecast reliability.'],['Not intended for','Diagnosis, treatment, medication dosing or autonomous clinical decision-making.'],['Data','Synthetic development data currently in the repository; CGMacros is the planned primary experiment.'],['Two-stream fusion','Dynamic CGM/wearable/meal signals fused with static EHR context.'],['Adverse event','Glucose >180 mg/dL or <70 mg/dL within 60 minutes.'],['Known limitations','Synthetic development data, calibration limits, temporal demonstration, no clinical validation.'],['Interpretability','Reliability reason codes expose signal conditions associated with caution/abstention.'],['Safety','When reliability is insufficient, MetaTwin can withhold the event alert rather than present false certainty.']].map(([a,b])=><article key={a}><small>{a}</small><p>{b}</p></article>)}</div></section>}
 
-              <article className="patient-card event-card">
-                <p className="kicker">02 · ADVERSE EVENT LAYER</p>
-                <div className="event-title"><h4>What could happen next?</h4><span>60 MIN</span></div>
-                <div className="event-thresholds">
-                  <div><strong>&gt;180</strong><span>mg/dL · hyperglycemic event</span></div>
-                  <div><strong>&lt;70</strong><span>mg/dL · hypoglycemic event</span></div>
-                </div>
-                <p className="event-note">The event layer evaluates whether the forecast crosses either threshold within 60 minutes. Reliability gating determines whether an alert should be surfaced or withheld.</p>
-              </article>
-            </div>
-          </div>
-
-          <div className="clinical-flow">
-            <article><span>01</span><b>Patient data</b><p>CGM + wearable + meals + EHR</p></article>
-            <div className="flow-arrow">→</div>
-            <article><span>02</span><b>Digital twin</b><p>Personalized glucose trajectory</p></article>
-            <div className="flow-arrow">→</div>
-            <article><span>03</span><b>Event prediction</b><p>&gt;180 or &lt;70 within 60 min</p></article>
-            <div className="flow-arrow">→</div>
-            <article><span>04</span><b>Reliability gate</b><p>Forecast · Caution · Abstain</p></article>
-          </div>
-
-          <div className="metrics clinical-metrics">
-            <article><small>FORECAST MAE</small><strong>{metric(summary.mae_xgboost)}</strong><span>mg/dL · 60-minute model</span></article>
-            <article className="highlight"><small>FAILURE AUROC</small><strong>{metric(summary.auroc_failure, 2)}</strong><span>reliability detector</span></article>
-            <article><small>FAILURE PREVALENCE</small><strong>{metric(Number(summary.failure_prevalence) * 100)}%</strong><span>current evaluation data</span></article>
-            <article><small>BASELINE MAE</small><strong>{metric(summary.mae_persistence)}</strong><span>mg/dL · persistence</span></article>
-          </div>
-
-          <div className="clinical-boundary"><strong>Research boundary</strong><span>This prototype predicts and evaluates glucose-event risk; it does not diagnose, prescribe treatment, or replace clinical judgment.</span></div>
-        </section>
-      )}
-
-      {tab === 'trust' && (
-        <section className="content">
-          <div className="section-intro single"><div><p className="kicker">RELIABILITY LAYER</p><h3>The event prediction is only surfaced when its reliability is understood.</h3></div></div>
-          <div className="trust-layout">
-            <div className="trust-score"><small>FAILURE-DETECTION AUROC</small><strong>{loading || error ? '—' : metric(reliability, 2)}</strong><span>Measures separation between likely-successful and likely-failed glucose forecasts.</span></div>
-            <div className="trust-steps">
-              <div><b>01</b><div><strong>Forecast</strong><p>Estimate the patient's glucose trajectory over the next 60 minutes.</p></div></div>
-              <div><b>02</b><div><strong>Predict forecast failure</strong><p>Use information available at prediction time to estimate whether the forecast may be wrong.</p></div></div>
-              <div><b>03</b><div><strong>Gate the clinical event</strong><p>High reliability can surface an event alert; low reliability can withhold or downgrade it.</p></div></div>
-              <div><b>04</b><div><strong>Abstain</strong><p>When evidence is insufficient, MetaTwin explicitly avoids presenting false certainty.</p></div></div>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {tab === 'research' && (
-        <section className="content">
-          <div className="section-intro single"><div><p className="kicker">RESEARCH EVIDENCE</p><h3>Measure whether the twin deserves to be trusted.</h3></div></div>
-          <div className="metrics">
-            <article><small>PERSISTENCE MAE</small><strong>{metric(summary.mae_persistence)}</strong><span>mg/dL · baseline</span></article>
-            <article className="highlight"><small>XGBOOST MAE</small><strong>{metric(summary.mae_xgboost)}</strong><span>mg/dL · {Number.isFinite(gain) ? `${metric(gain)}% below baseline` : 'model result'}</span></article>
-            <article><small>XGBOOST RMSE</small><strong>{metric(summary.rmse_xgboost)}</strong><span>mg/dL · 60-minute forecast</span></article>
-            <article><small>FAILURE AUPRC</small><strong>{metric(summary.auprc_failure, 2)}</strong><span>reliability detector</span></article>
-          </div>
-          <div className="two-panels">
-            <article><p className="kicker">FORECASTING</p><h4>What might happen next?</h4><p>The forecaster estimates near-term glucose and is evaluated against a persistence baseline. The primary horizon is 60 minutes.</p></article>
-            <article><p className="kicker">ADVERSE EVENT</p><h4>What specific event are we predicting?</h4><p>Glucose above 180 mg/dL or below 70 mg/dL within the prediction window. Reliability gating is used to control whether an event alert should be surfaced.</p></article>
-          </div>
-          <div className="research-callout"><strong>Validation status</strong><span>These displayed metrics are the current model-results API values. Final submission results should use out-of-fold residuals, patient-level bootstrap confidence intervals, and the completed event-layer evaluation.</span></div>
-        </section>
-      )}
-
-      <footer><span>MetaTwin · glucose digital twin</span><span>Patient → Event → Reliability → Abstain</span></footer>
-    </main>
-  );
+    <footer><span>MetaTwin · glucose digital twin · research prototype</span><span>Patient → Forecast → Event → Reliability → Abstain</span></footer>
+  </main>;
 }
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);
