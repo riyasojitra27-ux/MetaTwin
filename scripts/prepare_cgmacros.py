@@ -1,8 +1,8 @@
 """Prepare the public CGMacros dataset for MetaTwin.
 
 Raw CGMacros is intentionally NOT committed to GitHub. It is ~627 MB and is
-licensed separately by PhysioNet. Download it from the official source, extract
-it locally, then run this script.
+licensed separately by PhysioNet. Download/extract it locally, then run this
+script. The output is a canonical five-minute analysis grid.
 """
 from __future__ import annotations
 
@@ -35,6 +35,13 @@ def _numeric(s):
     return pd.to_numeric(s, errors="coerce")
 
 
+def _subject_id(value):
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    if not digits:
+        return None
+    return int(digits[-3:])
+
+
 def _read_subject(path: Path, pid: int) -> pd.DataFrame:
     df = pd.read_csv(path)
     ts_col = _first_col(df, ["Timestamp", "timestamp"])
@@ -48,9 +55,10 @@ def _read_subject(path: Path, pid: int) -> pd.DataFrame:
     out = pd.DataFrame({"timestamp": pd.to_datetime(df[ts_col], errors="coerce")})
     dex = _numeric(df[dex_col]) if dex_col else pd.Series(np.nan, index=df.index)
     lib = _numeric(df[lib_col]) if lib_col else pd.Series(np.nan, index=df.index)
+    # Dexcom is the preferred five-minute stream; Libre fills missing values.
     out["glucose"] = dex.combine_first(lib)
     out["heart_rate"] = _numeric(df[hr_col]) if hr_col else np.nan
-    out["mets"] = (_numeric(df[mets_col]) / 10.0) if mets_col else np.nan
+    out["mets"] = _numeric(df[mets_col]) if mets_col else np.nan
     for src, dst in [("Carbs", "meal_carbs"), ("Protein", "meal_protein"),
                      ("Fat", "meal_fat"), ("Fiber", "meal_fiber")]:
         out[dst] = _numeric(df[src]) if src in df.columns else 0.0
@@ -67,16 +75,16 @@ def _read_subject(path: Path, pid: int) -> pd.DataFrame:
 
 def _read_ehr(bio_path: Path) -> pd.DataFrame:
     bio = pd.read_csv(bio_path)
-    # The published CGMacros bio table uses `subject` as the participant ID.
     pid_col = _first_col(bio, ["subject", "Subject", "Participant", "Participant ID", "ID"])
     if pid_col is None:
         raise ValueError("CGMacros bio.csv must contain its subject identifier column.")
-    out = pd.DataFrame({"patient_id": _numeric(bio[pid_col])})
+    out = pd.DataFrame({"patient_id": bio[pid_col].map(_subject_id)})
     for src, dst in {"Age": "age", "Gender": "sex", "BMI": "bmi",
                      "A1c PDL (Lab)": "hba1c",
                      "Fasting GLU - PDL (Lab)": "fasting_glucose"}.items():
         out[dst] = bio[src] if src in bio.columns else np.nan
     out["baseline_hr"] = np.nan
+    out = out.dropna(subset=["patient_id"]).copy()
     out["patient_id"] = out.patient_id.astype(int)
     for c in ["age", "bmi", "hba1c", "fasting_glucose"]:
         out[c] = _numeric(out[c])
@@ -94,10 +102,9 @@ def prepare(raw_root: Path, output_root: Path):
 
     frames = []
     for f in subject_files:
-        digits = "".join(ch for ch in f.stem if ch.isdigit())
-        if not digits:
+        pid = _subject_id(f.stem)
+        if pid is None:
             continue
-        pid = int(digits[-3:])
         try:
             frames.append(_read_subject(f, pid))
         except ValueError as exc:
