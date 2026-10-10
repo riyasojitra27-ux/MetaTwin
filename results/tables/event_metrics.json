@@ -1,0 +1,45 @@
+{
+  "dataset": "included synthetic development data",
+  "validation": "temporal holdout; patient-grouped OOF reliability training and calibration",
+  "event_definition": "glucose >180 mg/dL or <70 mg/dL within 60 minutes",
+  "window_minutes": 60,
+  "without_gating": {
+    "precision": 0.9348155634158666,
+    "recall": 0.8983308042488619,
+    "f1": 0.9162101092642462,
+    "false_alarms": 1032,
+    "false_alarms_per_day": 6.88,
+    "true_positives": 14800,
+    "events": 16475,
+    "samples": 43200
+  },
+  "with_reliability_gating": {
+    "precision": 0.9351214208046393,
+    "recall": 0.7830045523520486,
+    "f1": 0.8523290386521308,
+    "false_alarms": 895,
+    "false_alarms_per_day": 5.966666666666667,
+    "true_positives": 12900,
+    "events": 16475,
+    "samples": 43200
+  },
+  "failure_detector": {
+    "auroc": 0.6727637805016664,
+    "auprc": 0.10404563721564966
+  },
+  "reliability_thresholds": {
+    "caution": 0.05511391177896269,
+    "abstain": 0.13812154696132597
+  },
+  "trust_coverage": {
+    "Forecast": 69.23148148148148,
+    "Caution": 25.03472222222222,
+    "Abstain": 5.733796296296297
+  },
+  "bootstrap_95_ci": {
+    "precision": [0.9208235658814913, 0.9476101654000572],
+    "recall": [0.878446940771591, 0.9145974718830359],
+    "f1": [0.9022127557088759, 0.9288727856787194]
+  },
+  "note": "These are synthetic development results for reproducibility and demo validation, not clinical validation or real-dataset headline results."
+}
