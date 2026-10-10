@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS patients (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), patient_id text UNIQUE NOT NULL, name text NOT NULL, age integer, sex text, bmi numeric, hba1c numeric, diabetes_status text, baseline_glucose numeric, notes text DEFAULT '', created_at timestamptz DEFAULT now())

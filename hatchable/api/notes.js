@@ -1,0 +1,3 @@
+import { db } from 'hatchable';
+export const access='public'; export const methods=['GET','POST'];
+export default async function(req,res){const b=req.body||{}; if(req.method==='POST'){const {rows}=await db.query('INSERT INTO notes (patient_id,body) VALUES ($1,$2) RETURNING *',[b.patient_id,b.body]);return res.status(201).json(rows[0])} const {rows}=await db.query('SELECT * FROM notes WHERE patient_id=$1 ORDER BY created_at DESC',[req.query.patient_id]);res.json(rows)}

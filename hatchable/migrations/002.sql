@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS readings (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), patient_id text NOT NULL, recorded_at timestamptz NOT NULL, glucose numeric NOT NULL, heart_rate numeric, carbs numeric, activity numeric, created_at timestamptz DEFAULT now())

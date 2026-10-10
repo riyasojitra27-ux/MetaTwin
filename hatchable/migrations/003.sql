@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS notes (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), patient_id text NOT NULL, body text NOT NULL, created_at timestamptz DEFAULT now())

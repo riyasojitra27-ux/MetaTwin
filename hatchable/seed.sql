@@ -1,0 +1,1 @@
+INSERT INTO patients (patient_id,name,age,sex,bmi,hba1c,diabetes_status,baseline_glucose,notes) SELECT 'MT-001','Aarav Patel',46,'M',27.4,7.1,'Type 2',132,'Demo patient — post-meal variability.' WHERE NOT EXISTS (SELECT 1 FROM patients WHERE patient_id='MT-001')

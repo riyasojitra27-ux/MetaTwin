@@ -1,0 +1,3 @@
+import { db } from 'hatchable';
+export const access='public'; export const methods=['GET','POST'];
+export default async function(req,res){const b=req.body||{}; if(req.method==='POST'){const {rows}=await db.query('INSERT INTO readings (patient_id,recorded_at,glucose,heart_rate,carbs,activity) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',[b.patient_id,b.recorded_at||new Date().toISOString(),b.glucose,b.heart_rate||null,b.carbs||0,b.activity||0]);return res.status(201).json(rows[0])} const {rows}=await db.query('SELECT * FROM readings WHERE patient_id=$1 ORDER BY recorded_at DESC LIMIT 80',[req.query.patient_id]);res.json(rows)}
